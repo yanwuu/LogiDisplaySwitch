@@ -18,5 +18,9 @@
     <string>2.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>LogiDisplaySwitch 需要访问蓝牙以监测罗技键盘连接状态并联动显示器切换</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>LogiDisplaySwitch 需要访问蓝牙以监测罗技键盘连接状态并联动显示器切换</string>
 </dict>
 </plist>

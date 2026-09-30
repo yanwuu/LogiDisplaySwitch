@@ -32,6 +32,8 @@ mkdir -p "$APP_DIR/Contents/Resources"
 cp LogiDisplaySwitch/Info.plist "$APP_DIR/Contents/Info.plist"
 cp LogiDisplaySwitch/LogiDisplaySwitch "$APP_DIR/Contents/MacOS/LogiDisplaySwitch"
 cp LogiDisplaySwitch/LogiDisplaySwitch dist/LogiDisplaySwitch
+codesign -s - -f dist/LogiDisplaySwitch
+codesign -s - -f --deep "$APP_DIR"
 
 echo "✅ 打包完成！输出位置："
 echo "   - 应用包: dist/LogiDisplaySwitch.app"

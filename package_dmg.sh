@@ -19,7 +19,7 @@ clang -fobjc-arc -fmodules -fmodules-cache-path=.module_cache \
   LogiDisplaySwitch/DisplayBridge.o \
   LogiDisplaySwitch/MouseSwitch.o \
   m1ddc-src/library/libm1ddc.a \
-  -framework CoreDisplay -framework CoreGraphics -framework Foundation -framework IOKit -framework AppKit \
+  -framework CoreDisplay -framework CoreGraphics -framework Foundation -framework IOKit -framework AppKit -framework IOBluetooth \
   -o LogiDisplaySwitch/LogiDisplaySwitch
 
 codesign -s - -f LogiDisplaySwitch/LogiDisplaySwitch
