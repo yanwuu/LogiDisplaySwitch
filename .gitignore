@@ -1,0 +1,9 @@
+.DS_Store
+.module_cache/
+*.o
+LogiDisplaySwitch/*.o
+LogiDisplaySwitch/_CodeSignature/
+scratch_*
+m1ddc-src/.module_cache/
+m1ddc-src/.objects/
+m1ddc-src/library/libm1ddc.a
