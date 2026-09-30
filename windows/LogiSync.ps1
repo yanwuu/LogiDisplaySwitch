@@ -1,15 +1,14 @@
 ﻿<#
-    LogiSync.ps1 - Windows 端罗技键鼠显示器极速无感联动核心服务 (毫秒级响应 + 智能防误切)
-    硬件拓扑:
-      - 键盘 MX Keys: 优联槽位 0x01 (Feature 0x09)
-      - 鼠标 MX Master 3: 优联槽位 0x04 (Feature 0x09)
-      - 通信接口: PID 0xC52B, UsagePage 0xFF00, outLen 20
+    LogiSync.ps1 - Windows 端罗技鼠标跟随键盘专用极速联动服务
+    架构设计:
+      - 显示器切源: 由键盘与 Mac 联动全权负责 (键盘切离 Mac 切 DP，键盘连回 Mac 切 Type-C)
+      - Windows 核心使命: 专职负责让 MX Master 3 鼠标跟随键盘通道 (键盘回 Mac 时鼠标毫秒级切回 Mac)
+      - 彻底移除 Windows 端对显示器的软控，杜绝切屏回弹与误切
 #>
 param(
     [switch]$Test,
     [switch]$Watch,
     [switch]$SwitchToMac,
-    [int]$MacInput = 27,
     [int]$TargetMouseChannel = 1
 )
 
@@ -139,7 +138,7 @@ public class LogiController {
         return list;
     }
 
-    // 毫秒级极速切通道 (第一优先级无延时直发 MX Master 3，第二优先级冗余重发)
+    // 毫秒级极速切鼠标 (优先瞬发 MX Master 3 槽位 0x04)
     public static int SwitchDevices(int targetChannel) {
         byte hostVal = (byte)(targetChannel - 1);
         int successCount = 0;
@@ -153,7 +152,7 @@ public class LogiController {
                         int outLen = iface.OutLen;
                         if (outLen < 20) continue;
 
-                        // 1. 第一拍极速直发目标鼠标 (槽位 0x04) 与键盘 (0x01)，0 延迟下发！
+                        // 1. 第一拍极速直发目标鼠标 MX Master 3 (槽位 0x04) 与键盘 (0x01)，0 延迟下发！
                         byte[] prioritySlots = new byte[] { 0x04, 0x01 };
                         foreach (byte slot in prioritySlots) {
                             byte[] frame = new byte[outLen];
@@ -168,7 +167,7 @@ public class LogiController {
                             } catch {}
                         }
 
-                        // 2. 第二拍冗余补发其他槽位与备用特性码
+                        // 2. 第二拍冗余补发全槽位
                         byte[] allSlots = new byte[] { 0x04, 0x01, 0x02, 0x03, 0x05, 0x06, 0xFF };
                         byte[] feats = new byte[] { 0x09, 0x08, 0x0A };
                         foreach (byte slot in allSlots) {
@@ -193,7 +192,7 @@ public class LogiController {
         return successCount;
     }
 
-    // 高频低延迟监测键盘 (槽位 0x01) 是否在线
+    // 监测键盘 (槽位 0x01) 是否在当前 Windows 接收器上在线
     public static bool CheckKeyboardOnline() {
         var ifaces = GetUnifyingInterfaces();
         foreach (var iface in ifaces) {
@@ -219,7 +218,6 @@ public class LogiController {
 
                         byte[] buf = new byte[inLen];
                         var task = stream.ReadAsync(buf, 0, inLen);
-                        // 超时缩短为 180ms，毫秒级感知
                         if (Task.WaitAny(new Task[] { task }, 180) == 0 && !task.IsFaulted && task.Result > 0) {
                             if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
                                 return true;
@@ -232,110 +230,45 @@ public class LogiController {
         return false;
     }
 }
-
-public class MonitorController {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-    public struct PHYSICAL_MONITOR {
-        public IntPtr hPhysicalMonitor;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-        public string szPhysicalMonitorDescription;
-    }
-
-    private delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, IntPtr lprcMonitor, IntPtr dwData);
-
-    [DllImport("user32.dll")]
-    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
-
-    [DllImport("dxva2.dll", SetLastError = true)]
-    private static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint pdwNumberOfPhysicalMonitors);
-
-    [DllImport("dxva2.dll", SetLastError = true)]
-    private static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint dwPhysicalMonitorArraySize, [Out] PHYSICAL_MONITOR[] pPhysicalMonitorArray);
-
-    [DllImport("dxva2.dll", SetLastError = true)]
-    private static extern bool SetVCPFeature(IntPtr hMonitor, byte bVCPCode, uint dwNewValue);
-
-    [DllImport("dxva2.dll", SetLastError = true)]
-    private static extern bool DestroyPhysicalMonitor(IntPtr hMonitor);
-
-    public static bool SwitchInput(uint inputCode) {
-        List<IntPtr> hMonitors = new List<IntPtr>();
-        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr hMon, IntPtr hdc, IntPtr rc, IntPtr data) {
-            hMonitors.Add(hMon);
-            return true;
-        }, IntPtr.Zero);
-
-        bool anySuccess = false;
-        foreach (IntPtr hMon in hMonitors) {
-            uint count = 0;
-            if (GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out count) && count > 0) {
-                PHYSICAL_MONITOR[] phys = new PHYSICAL_MONITOR[count];
-                if (GetPhysicalMonitorsFromHMONITOR(hMon, count, phys)) {
-                    foreach (var p in phys) {
-                        if (SetVCPFeature(p.hPhysicalMonitor, 0x60, inputCode)) {
-                            anySuccess = true;
-                        }
-                        DestroyPhysicalMonitor(p.hPhysicalMonitor);
-                    }
-                }
-            }
-        }
-        return anySuccess;
-    }
-}
 '@
 
 # 测试入口
 if ($Test) {
     Write-Host '==============================================================' -ForegroundColor Cyan
-    Write-Host '  LogiSync 诊断与测试模式 (极速版)' -ForegroundColor Cyan
+    Write-Host '  LogiSync 鼠标切通道测试模式' -ForegroundColor Cyan
     Write-Host '==============================================================' -ForegroundColor Cyan
     Write-Host ''
     $idle = [LogiController]::GetIdleTimeMs()
     Write-Host "当前 Windows 键鼠空闲时间: $idle ms" -ForegroundColor White
     $isOnline = [LogiController]::CheckKeyboardOnline()
-    Write-Host "MX Keys 键盘在线状态: $isOnline" -ForegroundColor White
+    Write-Host "MX Keys 键盘在 Win 在线状态: $isOnline" -ForegroundColor White
     Write-Host ''
-    Write-Host '1. 正在将 MX Master 3 鼠标切回通道 1 (Mac)...' -ForegroundColor Yellow
+    Write-Host '正在将 MX Master 3 鼠标切回通道 1 (Mac)...' -ForegroundColor Yellow
     $cnt = [LogiController]::SwitchDevices(1)
     Write-Host "   [+] 切换数据包发送完毕 (共发送 $cnt 次)！请观察 MX Master 3 指示灯是否跳至 1." -ForegroundColor Green
-
-    Write-Host ''
-    Write-Host "2. 正在将显示器切回 Mac (Type-C $MacInput)..." -ForegroundColor Yellow
-    $dOk = [MonitorController]::SwitchInput($MacInput)
-    if ($dOk) {
-        Write-Host '   [+] 显示器 DDC/CI 切换指令发送成功!' -ForegroundColor Green
-    } else {
-        Write-Host '   [-] 显示器切换指令未收到 DDC/CI 确认，请检查显示器 OSD 菜单.' -ForegroundColor Red
-    }
-
     Write-Host ''
     Write-Host '测试完成。' -ForegroundColor Cyan
     exit 0
 }
 
-# 快捷单次切回 Mac
+# 快捷单次切鼠标回 Mac
 if ($SwitchToMac) {
     [LogiController]::SwitchDevices(1) | Out-Null
-    Start-Sleep -Milliseconds 80
-    [MonitorController]::SwitchInput($MacInput) | Out-Null
     exit 0
 }
 
-# 后台静默守护进程 (极速响应 + 防误切双模式)
+# 后台静默守护进程: 纯鼠标通道跟随守护
 if ($Watch) {
     $isArmed = $false
     $onlineStreak = 0
     $offlineStreak = 0
 
     while ($true) {
-        # 220ms 高频心跳循环
-        Start-Sleep -Milliseconds 220
+        Start-Sleep -Milliseconds 200
         try {
             $idleMs = [LogiController]::GetIdleTimeMs()
 
-            # 1. 如果用户正在 Windows 上激烈操作鼠标 (最近 350ms 内有鼠标移动或点击)：
-            # 用户正活跃在 Windows，重置离线计数，不执行切屏
+            # 1. 如果用户正在 Windows 上操作鼠标或打字，代表用户在当前系统，锁定不切
             if ($idleMs -lt 350) {
                 $offlineStreak = 0
                 $onlineStreak++
@@ -345,7 +278,7 @@ if ($Watch) {
                 continue
             }
 
-            # 2. 用户手已停下，立刻检测键盘状态
+            # 2. 用户手已停下，监测键盘是否切往 Mac
             $isKbdOnline = [LogiController]::CheckKeyboardOnline()
 
             if ($isKbdOnline) {
@@ -358,25 +291,20 @@ if ($Watch) {
                 $offlineStreak++
                 $onlineStreak = 0
 
-                # 智能自适应门槛:
-                # 场景 A (极速响应): 用户刚才还在用电脑 ($idleMs < 8000ms)，键盘突然离线
-                # 这种情况下键盘绝不可能因为超时休眠 (休眠需要至少15秒)，必定是用户按了 1 键切走！
-                # 仅需连续 2 次确认 (约 450ms)，瞬间切回 Mac！
+                # 键盘离线门槛:
+                # 刚才在用电脑 ($idleMs < 8000ms): 确认 2 次 (~400ms) 立即切鼠标
+                # 长时间挂机 ($idleMs >= 8000ms): 确认 5 次 (~1000ms) 避免休眠误切
                 $neededStreak = if ($idleMs -lt 8000) { 2 } else { 5 }
 
                 if ($isArmed -and $offlineStreak -ge $neededStreak) {
-                    # 1. 0延时优先切鼠标回通道 1 (Mac)
+                    # 键盘已切回 Mac！立即同步将鼠标切回通道 1 (Mac)
                     [LogiController]::SwitchDevices(1) | Out-Null
-                    Start-Sleep -Milliseconds 80
 
-                    # 2. 切显示器回 Mac (Type-C)
-                    [MonitorController]::SwitchInput($MacInput) | Out-Null
-
-                    # 3. 退出警戒，进入冷静期
+                    # 退出布防，进入冷静期 (等待键盘重新切回 Windows)
                     $isArmed = $false
                     $offlineStreak = 0
                     $onlineStreak = 0
-                    Start-Sleep -Milliseconds 4000
+                    Start-Sleep -Milliseconds 3000
                 }
             }
         } catch {
