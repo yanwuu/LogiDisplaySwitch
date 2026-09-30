@@ -48,6 +48,7 @@
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
     self.window = [[NSWindow alloc] initWithContentRect:frame styleMask:style backing:NSBackingStoreBuffered defer:NO];
     self.window.title = @"LogiDisplaySwitch - 罗技键鼠显示器联动控制面板";
+    self.window.releasedWhenClosed = NO;
     [self.window center];
     
     NSView *contentView = self.window.contentView;
@@ -131,6 +132,9 @@
 }
 
 - (void)showMainWindow {
+    if (!self.window) {
+        [self setupMainWindow];
+    }
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
