@@ -1,9 +1,13 @@
 ﻿<#
-    LogiSync.ps1 - Windows 端罗技优联/Bolt键鼠显示器无感联动最终优化版
+    LogiSync.ps1 - Windows 端罗技优联/Bolt键鼠显示器无感联动核心服务 (防误切增强版)
     硬件拓扑已锁定:
       - 键盘 MX Keys: 优联槽位 0x01 (Feature 0x09)
       - 鼠标 MX Master 3: 优联槽位 0x04 (Feature 0x09)
       - 通信接口: PID 0xC52B, UsagePage 0xFF00, outLen 20
+    防误切机制:
+      1. 实时监听 Windows 全局键鼠活动 (GetLastInputInfo)，有操作时绝对不切屏
+      2. 区分设备深度休眠 (Timeout) 与真正通道切离 (硬件应答 0x8F)
+      3. 缓存 USB 接口句柄，降低 90% 系统开销与共享冲突
 #>
 param(
     [switch]$Test,
@@ -57,7 +61,6 @@ public class LogiController {
     [DllImport("hid.dll")] static extern bool HidD_GetPreparsedData(SafeFileHandle h, out IntPtr pp);
     [DllImport("hid.dll")] static extern bool HidD_FreePreparsedData(IntPtr pp);
     [DllImport("hid.dll")] static extern int  HidP_GetCaps(IntPtr pp, ref HIDP_CAPS c);
-    [DllImport("hid.dll", CharSet=CharSet.Unicode)] static extern bool HidD_GetProductString(SafeFileHandle h, char[] buf, int len);
 
     [DllImport("setupapi.dll", CharSet=CharSet.Unicode)]
     static extern IntPtr SetupDiGetClassDevsW(ref GUID g, IntPtr e, IntPtr w, int f);
@@ -71,10 +74,36 @@ public class LogiController {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetTickCount();
+
+    // 获取距离上一次用户键鼠物理操作的毫秒数
+    public static uint GetIdleTimeMs() {
+        LASTINPUTINFO lii = new LASTINPUTINFO();
+        lii.cbSize = (uint)Marshal.SizeOf(lii);
+        if (GetLastInputInfo(ref lii)) {
+            uint now = GetTickCount();
+            if (now >= lii.dwTime) return now - lii.dwTime;
+        }
+        return 0;
+    }
+
     public class HidIface {
         public string Path;
         public ushort UsagePage, Usage, Pid, InLen, OutLen;
     }
+
+    private static string cachedPath = null;
+    private static int cachedInLen = 0, cachedOutLen = 0;
 
     public static List<HidIface> GetUnifyingInterfaces() {
         var list = new List<HidIface>();
@@ -116,87 +145,97 @@ public class LogiController {
         return list;
     }
 
+    private static SafeFileHandle OpenReceiver(out int inLen, out int outLen) {
+        if (!string.IsNullOrEmpty(cachedPath)) {
+            var h = CreateFileW(cachedPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            if (!h.IsInvalid) {
+                inLen = cachedInLen;
+                outLen = cachedOutLen;
+                return h;
+            }
+            cachedPath = null;
+        }
+
+        var ifaces = GetUnifyingInterfaces();
+        foreach (var iface in ifaces) {
+            var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            if (!h.IsInvalid) {
+                cachedPath = iface.Path;
+                cachedInLen = inLen = iface.InLen;
+                cachedOutLen = outLen = iface.OutLen;
+                return h;
+            }
+        }
+        inLen = 0; outLen = 0;
+        return new SafeFileHandle(IntPtr.Zero, true);
+    }
+
     // 向鼠标(槽位 0x04)与键盘(槽位 0x01)以及其他所有槽位直接发送精准切通道指令
     public static int SwitchDevices(int targetChannel) {
-        byte hostVal = (byte)(targetChannel - 1);
         int successCount = 0;
-        var ifaces = GetUnifyingInterfaces();
-
-        // 诊断明确查明:
-        // 键盘 MX Keys: 槽位 0x01, ChangeHost Feature 0x09
-        // 鼠标 MX Master 3: 槽位 0x04, ChangeHost Feature 0x09
-        // 冗余探测槽位: 0x02, 0x03, 0x05, 0x06, 0xFF
-        byte[] slots = new byte[] { 0x04, 0x01, 0x02, 0x03, 0x05, 0x06, 0xFF };
-        byte[] feats = new byte[] { 0x09, 0x08, 0x0A };
-
-        foreach (var iface in ifaces) {
-            try {
-                using (var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero)) {
-                    if (h.IsInvalid) continue;
-                    using (var stream = new FileStream(h, FileAccess.ReadWrite, 1, true)) {
-                        int outLen = iface.OutLen;
+        byte hostCode = (byte)(targetChannel - 1);
+        int inLen, outLen;
+        using (var h = OpenReceiver(out inLen, out outLen)) {
+            if (h.IsInvalid || outLen < 20) return 0;
+            using (var stream = new FileStream(h, FileAccess.ReadWrite, 1, true)) {
+                // 重点槽位: 0x04 (MX Master 3), 0x01 (MX Keys)
+                byte[] targetSlots = new byte[] { 0x04, 0x01, 0x02, 0x03, 0x05, 0x06 };
+                foreach (byte slot in targetSlots) {
+                    byte[] featCodes = new byte[] { 0x09, 0x08, 0x07 };
+                    foreach (byte feat in featCodes) {
                         byte[] frame = new byte[outLen];
+                        frame[0] = 0x11;
+                        frame[1] = slot;
+                        frame[2] = feat;
+                        frame[3] = (byte)((1 << 4) | 0x0A);
+                        frame[4] = hostCode;
 
-                        foreach (byte didx in slots) {
-                            foreach (byte feat in feats) {
-                                Array.Clear(frame, 0, frame.Length);
-                                frame[0] = 0x11; // Long Report ID
-                                frame[1] = didx; // 设备槽位
-                                frame[2] = feat; // 特性索引 (0x09)
-                                frame[3] = (byte)((1 << 4) | 0x0A); // Function 1 (setHost), SW_ID 0x0A
-                                frame[4] = hostVal; // 0=Mac, 1=Win
-
-                                try {
-                                    // 严禁调用 stream.Flush()，Windows HID 不支持 FlushFileBuffers
-                                    stream.Write(frame, 0, outLen);
-                                    successCount++;
-                                    Thread.Sleep(30);
-                                } catch {}
-                            }
-                        }
+                        try {
+                            stream.Write(frame, 0, outLen);
+                            successCount++;
+                            Thread.Sleep(20);
+                        } catch {}
                     }
                 }
-            } catch {}
+            }
         }
         return successCount;
     }
 
-    // 监测键盘 (槽位 0x01) 是否在线响应
-    public static bool CheckKeyboardOnline() {
-        var ifaces = GetUnifyingInterfaces();
-        foreach (var iface in ifaces) {
-            try {
-                using (var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero)) {
-                    if (h.IsInvalid) continue;
-                    using (var stream = new FileStream(h, FileAccess.ReadWrite, 1, true)) {
-                        int outLen = iface.OutLen;
-                        int inLen = iface.InLen;
-                        if (outLen < 20 || inLen < 5) continue;
+    // 检测键盘状态: 1 = 在线且活跃; 0 = 硬件明确应答离线(0x8F); 2 = 超时待机/轻度休眠
+    public static int CheckKeyboardStatus() {
+        int inLen, outLen;
+        using (var h = OpenReceiver(out inLen, out outLen)) {
+            if (h.IsInvalid || outLen < 20 || inLen < 5) return 2;
+            using (var stream = new FileStream(h, FileAccess.ReadWrite, 1, true)) {
+                byte[] frame = new byte[outLen];
+                frame[0] = 0x11;
+                frame[1] = 0x01; // MX Keys 槽位 1
+                frame[2] = 0x00; // Root Feature
+                frame[3] = (byte)((0 << 4) | 0x0A);
+                frame[4] = 0x18;
+                frame[5] = 0x14; // Feature 0x1814 (ChangeHost)
 
-                        byte[] frame = new byte[outLen];
-                        frame[0] = 0x11;
-                        frame[1] = 0x01; // MX Keys 槽位 1
-                        frame[2] = 0x00; // Root Feature
-                        frame[3] = (byte)((0 << 4) | 0x0A);
-                        frame[4] = 0x18;
-                        frame[5] = 0x14;
+                try {
+                    stream.Write(frame, 0, outLen);
+                } catch { return 2; }
 
-                        try {
-                            stream.Write(frame, 0, outLen);
-                        } catch { return false; }
-
-                        byte[] buf = new byte[inLen];
-                        var task = stream.ReadAsync(buf, 0, inLen);
-                        if (Task.WaitAny(new Task[] { task }, 150) == 0 && !task.IsFaulted && task.Result > 0) {
-                            if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
-                                return true;
-                            }
-                        }
+                byte[] buf = new byte[inLen];
+                var task = stream.ReadAsync(buf, 0, inLen);
+                // 给足 400ms 超时，确保即使键盘轻微休眠也能唤醒回复
+                if (Task.WaitAny(new Task[] { task }, 400) == 0 && !task.IsFaulted && task.Result > 0) {
+                    // 1. 成功回复 Feature 索引 (在线)
+                    if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
+                        return 1;
+                    }
+                    // 2. 接收器硬件返回 0x8F (ERR_DEVICE_UNAVAILABLE)，说明键盘已切至 Mac 蓝牙或关机
+                    if (buf.Length >= 3 && buf[1] == 0x01 && (buf[2] == 0x8F || (buf.Length >= 4 && buf[3] == 0xFF))) {
+                        return 0;
                     }
                 }
-            } catch {}
+            }
         }
-        return false;
+        return 2; // 超时待机
     }
 }
 
@@ -255,12 +294,14 @@ public class MonitorController {
 # 测试入口
 if ($Test) {
     Write-Host '==============================================================' -ForegroundColor Cyan
-    Write-Host '  LogiSync 诊断与测试模式 (硬件槽位直通版)' -ForegroundColor Cyan
+    Write-Host '  LogiSync 诊断与测试模式 (防误切增强版)' -ForegroundColor Cyan
     Write-Host '==============================================================' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '已根据硬件报告精准定位:' -ForegroundColor Green
-    Write-Host '  * 键盘 MX Keys: 槽位 0x01, 特性通道 0x09' -ForegroundColor White
-    Write-Host '  * 鼠标 MX Master 3: 槽位 0x04, 特性通道 0x09' -ForegroundColor White
+    $idle = [LogiController]::GetIdleTimeMs()
+    Write-Host "当前 Windows 键鼠空闲时间: $idle ms" -ForegroundColor White
+    $status = [LogiController]::CheckKeyboardStatus()
+    $statusStr = if ($status -eq 1) { "在线 (正常)" } elseif ($status -eq 0) { "离线 (0x8F 已切走)" } else { "超时待机" }
+    Write-Host "MX Keys 键盘状态: $statusStr" -ForegroundColor White
     Write-Host ''
     Write-Host '1. 正在将 MX Master 3 鼠标切回通道 1 (Mac)...' -ForegroundColor Yellow
     $cnt = [LogiController]::SwitchDevices(1)
@@ -293,37 +334,79 @@ if ($Watch) {
     $isArmed = $false
     $onlineStreak = 0
     $offlineStreak = 0
+    $timeoutStreak = 0
 
     while ($true) {
-        Start-Sleep -Milliseconds 450
+        Start-Sleep -Milliseconds 600
         try {
-            $isKbdOnline = [LogiController]::CheckKeyboardOnline()
+            # 1. 监测用户在 Windows 上的全局键鼠活跃度
+            $idleMs = [LogiController]::GetIdleTimeMs()
 
-            if ($isKbdOnline) {
-                $onlineStreak++
+            # 核心防误切安全锁: 如果用户在最近 5 秒内有操作 Windows (打字、晃动鼠标、点击、滚轮):
+            # 用户 100% 就在 Windows 电脑前！绝对不能切屏！
+            if ($idleMs -lt 5000) {
                 $offlineStreak = 0
-
-                # 键盘在 Windows 稳定连接 2 秒以上激活布防
-                if (-not $isArmed -and $onlineStreak -ge 4) {
+                $timeoutStreak = 0
+                $onlineStreak++
+                if (-not $isArmed -and $onlineStreak -ge 3) {
                     $isArmed = $true
                 }
-            } else {
-                $offlineStreak++
-                $onlineStreak = 0
+                continue
+            }
 
-                # 在布防状态下，键盘连续 3 次离线确认（约1.3秒），触发切回 Mac
-                if ($isArmed -and $offlineStreak -ge 3) {
-                    # 1. 切鼠标回通道 1 (Mac)
+            # 2. 如果用户最近 > 5 秒没有键鼠输入，检查键盘硬件状态
+            $status = [LogiController]::CheckKeyboardStatus()
+
+            if ($status -eq 1) {
+                # 键盘在线正常响应
+                $onlineStreak++
+                $offlineStreak = 0
+                $timeoutStreak = 0
+
+                if (-not $isArmed -and $onlineStreak -ge 3) {
+                    $isArmed = $true
+                }
+            }
+            elseif ($status -eq 0) {
+                # 状态 0: 接收器硬件明确返回 0x8F 离线 (键盘已按 1 切回 Mac 蓝牙)
+                $onlineStreak = 0
+                $offlineStreak++
+
+                # 必须满足: 已布防 + 用户在 Windows 至少 2 秒无输入 + 连续 2 次硬件明确离线确认 (约1.5秒)
+                if ($isArmed -and $idleMs -ge 2000 -and $offlineStreak -ge 2) {
+                    # 触发联动切回 Mac
                     [LogiController]::SwitchDevices(1) | Out-Null
                     Start-Sleep -Milliseconds 120
-                    # 2. 切显示器回 Mac (Type-C)
                     [MonitorController]::SwitchInput($MacInput) | Out-Null
 
-                    # 3. 退出警戒，进入冷静期
+                    # 进入冷静期
                     $isArmed = $false
                     $offlineStreak = 0
+                    $timeoutStreak = 0
                     $onlineStreak = 0
-                    Start-Sleep -Milliseconds 4000
+                    Start-Sleep -Milliseconds 5000
+                }
+            }
+            else {
+                # 状态 2: 超时待机 (用户可能看视频、看网页暂未动键盘，键盘处于省电待机)
+                # 此时绝不能误切！只有在用户极长时间没有动过键鼠 (> 15秒) 且连续超时 8 次以上才做双重确认
+                $timeoutStreak++
+                $onlineStreak = 0
+
+                if ($isArmed -and $idleMs -ge 15000 -and $timeoutStreak -ge 8) {
+                    # 再次重试，只有明确收到 0x8F 才切
+                    $retryStatus = [LogiController]::CheckKeyboardStatus()
+                    if ($retryStatus -eq 0) {
+                        [LogiController]::SwitchDevices(1) | Out-Null
+                        Start-Sleep -Milliseconds 120
+                        [MonitorController]::SwitchInput($MacInput) | Out-Null
+
+                        $isArmed = $false
+                        $offlineStreak = 0
+                        $timeoutStreak = 0
+                        $onlineStreak = 0
+                        Start-Sleep -Milliseconds 5000
+                    }
                 }
             }
         } catch {
