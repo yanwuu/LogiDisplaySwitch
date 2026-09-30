@@ -1,5 +1,6 @@
 #import "DeviceWatcher.h"
 #import <AppKit/AppKit.h>
+#import <IOBluetooth/IOBluetooth.h>
 
 @interface DeviceWatcher () {
     IOHIDManagerRef _hidManager;
@@ -107,27 +108,20 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
     return NO;
 }
 
-- (BOOL)checkCurrentState {
-    if (!_hidManager) return NO;
-    
-    BOOL found = NO;
-    CFSetRef deviceSet = IOHIDManagerCopyDevices(_hidManager);
-    if (deviceSet) {
-        CFIndex count = CFSetGetCount(deviceSet);
-        const void *values[count];
-        CFSetGetValues(deviceSet, values);
-        for (CFIndex i = 0; i < count; i++) {
-            IOHIDDeviceRef dev = (IOHIDDeviceRef)values[i];
-            if ([self isTargetDevice:dev]) {
-                found = YES;
-                break;
-            }
+- (BOOL)isBluetoothTargetConnected {
+    NSArray *devices = [IOBluetoothDevice pairedDevices];
+    for (IOBluetoothDevice *dev in devices) {
+        if ([dev.name containsString:_targetDevicePattern]) {
+            return [dev isConnected];
         }
-        CFRelease(deviceSet);
     }
-    
-    _isTargetConnected = found;
-    return found;
+    return NO;
+}
+
+- (BOOL)checkCurrentState {
+    BOOL connected = [self isBluetoothTargetConnected];
+    _isTargetConnected = connected;
+    return connected;
 }
 
 - (void)onDeviceAttached:(IOHIDDeviceRef)device {
@@ -135,15 +129,32 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
     if (![self isTargetDevice:device]) return;
     
     NSString *name = [self getProductName:device];
-    NSLog(@"[DeviceWatcher] 检测到目标设备已连接: %@", name);
+    
+    // 关键校验：必须通过 IOBluetooth 确认目标蓝牙物理链路确实在线！
+    // 杜绝在 Windows 打字或休眠唤醒时，macOS BLE 产生偶发后台嗅探的幽灵伪连接事件
+    if (![self isBluetoothTargetConnected]) {
+        NSLog(@"[DeviceWatcher] 忽略伪挂载事件 [%@]: Bluetooth 物理链路并未连接", name);
+        return;
+    }
+    
+    NSLog(@"[DeviceWatcher] 检测到目标设备物理在线: %@", name);
     
     if (!_isTargetConnected) {
-        _isTargetConnected = YES;
-        _lastChangeTime = [[NSDate date] timeIntervalSince1970];
-        NSLog(@"[DeviceWatcher] 确认目标设备已连回 Mac，触发切回 Mac (Type-C)！");
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-            if (self.onStateChanged) {
-                self.onStateChanged(YES, name);
+        // 二次确认防抖 (150ms 缓冲)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            if (![self isBluetoothTargetConnected]) {
+                NSLog(@"[DeviceWatcher] 150ms 防抖未通过，忽略偶发连接信号");
+                return;
+            }
+            if (!self->_isTargetConnected) {
+                self->_isTargetConnected = YES;
+                self->_lastChangeTime = [[NSDate date] timeIntervalSince1970];
+                NSLog(@"[DeviceWatcher] 确认目标设备已稳定连回 Mac，触发切回 Mac (Type-C)！");
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    if (self.onStateChanged) {
+                        self.onStateChanged(YES, name);
+                    }
+                });
             }
         });
     }
@@ -154,15 +165,24 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
     if (![self isTargetDevice:device]) return;
     
     NSString *name = [self getProductName:device];
-    NSLog(@"[DeviceWatcher] 检测到目标设备已断开: %@", name);
+    NSLog(@"[DeviceWatcher] 检测到目标设备断开信号: %@", name);
     
     if (_isTargetConnected) {
-        _isTargetConnected = NO;
-        _lastChangeTime = [[NSDate date] timeIntervalSince1970];
-        NSLog(@"[DeviceWatcher] 确认目标设备已切离 Mac，立即触发切往 Windows (DP)！");
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-            if (self.onStateChanged) {
-                self.onStateChanged(NO, name);
+        // 延时 100ms 确认是否物理断开 (避免多子接口注销顺序造成的误判)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            if ([self isBluetoothTargetConnected]) {
+                NSLog(@"[DeviceWatcher] 目标设备仍在线，忽略子接口注销");
+                return;
+            }
+            if (self->_isTargetConnected) {
+                self->_isTargetConnected = NO;
+                self->_lastChangeTime = [[NSDate date] timeIntervalSince1970];
+                NSLog(@"[DeviceWatcher] 确认目标设备已真正切离 Mac，立即触发切往 Windows (DP)！");
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    if (self.onStateChanged) {
+                        self.onStateChanged(NO, name);
+                    }
+                });
             }
         });
     }
