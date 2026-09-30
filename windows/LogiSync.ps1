@@ -1,6 +1,6 @@
 ﻿<#
-    LogiSync.ps1 - Windows 端罗技优联/Bolt键鼠显示器无感联动核心服务 (稳定精简版)
-    硬件拓扑已锁定:
+    LogiSync.ps1 - Windows 端罗技键鼠显示器极速无感联动核心服务 (毫秒级响应 + 智能防误切)
+    硬件拓扑:
       - 键盘 MX Keys: 优联槽位 0x01 (Feature 0x09)
       - 鼠标 MX Master 3: 优联槽位 0x04 (Feature 0x09)
       - 通信接口: PID 0xC52B, UsagePage 0xFF00, outLen 20
@@ -139,14 +139,11 @@ public class LogiController {
         return list;
     }
 
-    // 向鼠标(槽位 0x04)与键盘(槽位 0x01)以及其他所有槽位直接发送精准切通道指令 (验证有效稳定版)
+    // 毫秒级极速切通道 (第一优先级无延时直发 MX Master 3，第二优先级冗余重发)
     public static int SwitchDevices(int targetChannel) {
         byte hostVal = (byte)(targetChannel - 1);
         int successCount = 0;
         var ifaces = GetUnifyingInterfaces();
-
-        byte[] slots = new byte[] { 0x04, 0x01, 0x02, 0x03, 0x05, 0x06, 0xFF };
-        byte[] feats = new byte[] { 0x09, 0x08, 0x0A };
 
         foreach (var iface in ifaces) {
             try {
@@ -156,7 +153,25 @@ public class LogiController {
                         int outLen = iface.OutLen;
                         if (outLen < 20) continue;
 
-                        foreach (byte slot in slots) {
+                        // 1. 第一拍极速直发目标鼠标 (槽位 0x04) 与键盘 (0x01)，0 延迟下发！
+                        byte[] prioritySlots = new byte[] { 0x04, 0x01 };
+                        foreach (byte slot in prioritySlots) {
+                            byte[] frame = new byte[outLen];
+                            frame[0] = 0x11;
+                            frame[1] = slot;
+                            frame[2] = 0x09; // Feature 0x09 (ChangeHost)
+                            frame[3] = (byte)((1 << 4) | 0x0A);
+                            frame[4] = hostVal;
+                            try {
+                                stream.Write(frame, 0, outLen);
+                                successCount++;
+                            } catch {}
+                        }
+
+                        // 2. 第二拍冗余补发其他槽位与备用特性码
+                        byte[] allSlots = new byte[] { 0x04, 0x01, 0x02, 0x03, 0x05, 0x06, 0xFF };
+                        byte[] feats = new byte[] { 0x09, 0x08, 0x0A };
+                        foreach (byte slot in allSlots) {
                             foreach (byte feat in feats) {
                                 byte[] frame = new byte[outLen];
                                 frame[0] = 0x11;
@@ -164,11 +179,10 @@ public class LogiController {
                                 frame[2] = feat;
                                 frame[3] = (byte)((1 << 4) | 0x0A);
                                 frame[4] = hostVal;
-
                                 try {
                                     stream.Write(frame, 0, outLen);
                                     successCount++;
-                                    Thread.Sleep(25);
+                                    Thread.Sleep(15);
                                 } catch {}
                             }
                         }
@@ -179,7 +193,7 @@ public class LogiController {
         return successCount;
     }
 
-    // 监测键盘 (槽位 0x01) 是否在线响应
+    // 高频低延迟监测键盘 (槽位 0x01) 是否在线
     public static bool CheckKeyboardOnline() {
         var ifaces = GetUnifyingInterfaces();
         foreach (var iface in ifaces) {
@@ -205,8 +219,8 @@ public class LogiController {
 
                         byte[] buf = new byte[inLen];
                         var task = stream.ReadAsync(buf, 0, inLen);
-                        // 超时给 300ms，轻微休眠也能有充分时间回包
-                        if (Task.WaitAny(new Task[] { task }, 300) == 0 && !task.IsFaulted && task.Result > 0) {
+                        // 超时缩短为 180ms，毫秒级感知
+                        if (Task.WaitAny(new Task[] { task }, 180) == 0 && !task.IsFaulted && task.Result > 0) {
                             if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
                                 return true;
                             }
@@ -274,7 +288,7 @@ public class MonitorController {
 # 测试入口
 if ($Test) {
     Write-Host '==============================================================' -ForegroundColor Cyan
-    Write-Host '  LogiSync 诊断与测试模式' -ForegroundColor Cyan
+    Write-Host '  LogiSync 诊断与测试模式 (极速版)' -ForegroundColor Cyan
     Write-Host '==============================================================' -ForegroundColor Cyan
     Write-Host ''
     $idle = [LogiController]::GetIdleTimeMs()
@@ -303,52 +317,58 @@ if ($Test) {
 # 快捷单次切回 Mac
 if ($SwitchToMac) {
     [LogiController]::SwitchDevices(1) | Out-Null
-    Start-Sleep -Milliseconds 120
+    Start-Sleep -Milliseconds 80
     [MonitorController]::SwitchInput($MacInput) | Out-Null
     exit 0
 }
 
-# 后台静默守护进程
+# 后台静默守护进程 (极速响应 + 防误切双模式)
 if ($Watch) {
     $isArmed = $false
     $onlineStreak = 0
     $offlineStreak = 0
 
     while ($true) {
-        Start-Sleep -Milliseconds 500
+        # 220ms 高频心跳循环
+        Start-Sleep -Milliseconds 220
         try {
-            # 1. 监测用户在 Windows 上的全局键鼠活跃度
             $idleMs = [LogiController]::GetIdleTimeMs()
 
-            # 【核心安全锁】如果用户在最近 3 秒内有操作 Windows (打字、移动鼠标、点击):
-            # 说明用户 100% 就在 Windows 电脑前使用，绝对不能切屏！
-            if ($idleMs -lt 3000) {
+            # 1. 如果用户正在 Windows 上激烈操作鼠标 (最近 350ms 内有鼠标移动或点击)：
+            # 用户正活跃在 Windows，重置离线计数，不执行切屏
+            if ($idleMs -lt 350) {
                 $offlineStreak = 0
                 $onlineStreak++
-                if (-not $isArmed -and $onlineStreak -ge 3) {
+                if (-not $isArmed -and $onlineStreak -ge 4) {
                     $isArmed = $true
                 }
                 continue
             }
 
-            # 2. 如果用户超过 3 秒未操作 Windows，检测键盘是否切走
+            # 2. 用户手已停下，立刻检测键盘状态
             $isKbdOnline = [LogiController]::CheckKeyboardOnline()
 
             if ($isKbdOnline) {
                 $onlineStreak++
                 $offlineStreak = 0
-                if (-not $isArmed -and $onlineStreak -ge 3) {
+                if (-not $isArmed -and $onlineStreak -ge 4) {
                     $isArmed = $true
                 }
             } else {
                 $offlineStreak++
                 $onlineStreak = 0
 
-                # 必须满足: 已布防 + 键盘连续 3 次探测离线 (约2.4秒) + 用户在 Windows 至少 2 秒无操作
-                if ($isArmed -and $offlineStreak -ge 3 -and $idleMs -ge 2000) {
-                    # 1. 切鼠标回通道 1 (Mac)
+                # 智能自适应门槛:
+                # 场景 A (极速响应): 用户刚才还在用电脑 ($idleMs < 8000ms)，键盘突然离线
+                # 这种情况下键盘绝不可能因为超时休眠 (休眠需要至少15秒)，必定是用户按了 1 键切走！
+                # 仅需连续 2 次确认 (约 450ms)，瞬间切回 Mac！
+                $neededStreak = if ($idleMs -lt 8000) { 2 } else { 5 }
+
+                if ($isArmed -and $offlineStreak -ge $neededStreak) {
+                    # 1. 0延时优先切鼠标回通道 1 (Mac)
                     [LogiController]::SwitchDevices(1) | Out-Null
-                    Start-Sleep -Milliseconds 120
+                    Start-Sleep -Milliseconds 80
+
                     # 2. 切显示器回 Mac (Type-C)
                     [MonitorController]::SwitchInput($MacInput) | Out-Null
 
@@ -356,7 +376,7 @@ if ($Watch) {
                     $isArmed = $false
                     $offlineStreak = 0
                     $onlineStreak = 0
-                    Start-Sleep -Milliseconds 5000
+                    Start-Sleep -Milliseconds 4000
                 }
             }
         } catch {
