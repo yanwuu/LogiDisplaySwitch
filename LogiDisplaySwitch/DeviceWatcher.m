@@ -130,6 +130,12 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
     
     NSString *name = [self getProductName:device];
     
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - _lastChangeTime < 2.5) {
+        NSLog(@"[DeviceWatcher] 处于切换冷却期 (%.1fs < 2.5s)，忽略附着事件 [%@]", now - _lastChangeTime, name);
+        return;
+    }
+    
     // 关键校验：必须通过 IOBluetooth 确认目标蓝牙物理链路确实在线！
     // 杜绝在 Windows 打字或休眠唤醒时，macOS BLE 产生偶发后台嗅探的幽灵伪连接事件
     if (![self isBluetoothTargetConnected]) {
@@ -140,10 +146,15 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
     NSLog(@"[DeviceWatcher] 检测到目标设备物理在线: %@", name);
     
     if (!_isTargetConnected) {
-        // 二次确认防抖 (150ms 缓冲)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        // 二次确认防抖 (300ms 缓冲)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
             if (![self isBluetoothTargetConnected]) {
-                NSLog(@"[DeviceWatcher] 150ms 防抖未通过，忽略偶发连接信号");
+                NSLog(@"[DeviceWatcher] 300ms 防抖未通过，忽略偶发连接信号");
+                return;
+            }
+            NSTimeInterval innerNow = [[NSDate date] timeIntervalSince1970];
+            if (innerNow - self->_lastChangeTime < 2.5) {
+                NSLog(@"[DeviceWatcher] 冷却防抖未通过 (%.1fs < 2.5s)，忽略偶发连接信号", innerNow - self->_lastChangeTime);
                 return;
             }
             if (!self->_isTargetConnected) {
@@ -168,8 +179,8 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
     NSLog(@"[DeviceWatcher] 检测到目标设备断开信号: %@", name);
     
     if (_isTargetConnected) {
-        // 延时 100ms 确认是否物理断开 (避免多子接口注销顺序造成的误判)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        // 延时 200ms 确认是否物理断开 (避免多子接口注销顺序造成的误判)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
             if ([self isBluetoothTargetConnected]) {
                 NSLog(@"[DeviceWatcher] 目标设备仍在线，忽略子接口注销");
                 return;

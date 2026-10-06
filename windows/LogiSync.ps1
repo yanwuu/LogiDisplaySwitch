@@ -1,4 +1,4 @@
-﻿<#
+<#
     LogiSync.ps1 - Windows 端罗技鼠标跟随键盘专用极速联动服务
     架构设计:
       - 显示器切源: 由键盘与 Mac 联动全权负责 (键盘切离 Mac 切 DP，键盘连回 Mac 切 Type-C)
@@ -138,7 +138,7 @@ public class LogiController {
         return list;
     }
 
-    // 毫秒级极速切鼠标 (优先瞬发 MX Master 3 槽位 0x04)
+    // 毫秒级极速切鼠标 (优先瞬发 MX Master 3 槽位 0x04 与 0x02，严格杜绝下发键盘 0x01)
     public static int SwitchDevices(int targetChannel) {
         byte hostVal = (byte)(targetChannel - 1);
         int successCount = 0;
@@ -152,8 +152,9 @@ public class LogiController {
                         int outLen = iface.OutLen;
                         if (outLen < 20) continue;
 
-                        // 1. 第一拍极速直发目标鼠标 MX Master 3 (槽位 0x04) 与键盘 (0x01)，0 延迟下发！
-                        byte[] prioritySlots = new byte[] { 0x04, 0x01 };
+                        // 1. 第一拍极速直发目标鼠标 MX Master 3 (通常为槽位 0x04 或 0x02)，0 延迟下发！
+                        // 注意: 绝不包含 0x01 (键盘)！键盘是唯一物理主控，严禁软件倒切键盘导致切屏回弹！
+                        byte[] prioritySlots = new byte[] { 0x04, 0x02 };
                         foreach (byte slot in prioritySlots) {
                             byte[] frame = new byte[outLen];
                             frame[0] = 0x11;
@@ -167,10 +168,10 @@ public class LogiController {
                             } catch {}
                         }
 
-                        // 2. 第二拍冗余补发全槽位
-                        byte[] allSlots = new byte[] { 0x04, 0x01, 0x02, 0x03, 0x05, 0x06, 0xFF };
-                        byte[] feats = new byte[] { 0x09, 0x08, 0x0A };
-                        foreach (byte slot in allSlots) {
+                        // 2. 第二拍冗余补发鼠标候选槽位 (绝不包含 0x01 键盘槽位)
+                        byte[] mouseSlots = new byte[] { 0x04, 0x02, 0x03, 0x05 };
+                        byte[] feats = new byte[] { 0x09, 0x08, 0x0A, 0x07 };
+                        foreach (byte slot in mouseSlots) {
                             foreach (byte feat in feats) {
                                 byte[] frame = new byte[outLen];
                                 frame[0] = 0x11;
@@ -181,7 +182,7 @@ public class LogiController {
                                 try {
                                     stream.Write(frame, 0, outLen);
                                     successCount++;
-                                    Thread.Sleep(15);
+                                    Thread.Sleep(10);
                                 } catch {}
                             }
                         }
@@ -212,16 +213,20 @@ public class LogiController {
                         frame[4] = 0x18;
                         frame[5] = 0x14; // Feature 0x1814 (ChangeHost)
 
-                        try {
-                            stream.Write(frame, 0, outLen);
-                        } catch { return false; }
+                        // 尝试最多 2 次查询 (每次 300ms 超时)，消除无线丢包或键盘浅度省电唤醒延迟
+                        for (int attempt = 0; attempt < 2; attempt++) {
+                            try {
+                                stream.Write(frame, 0, outLen);
+                            } catch { continue; }
 
-                        byte[] buf = new byte[inLen];
-                        var task = stream.ReadAsync(buf, 0, inLen);
-                        if (Task.WaitAny(new Task[] { task }, 180) == 0 && !task.IsFaulted && task.Result > 0) {
-                            if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
-                                return true;
+                            byte[] buf = new byte[inLen];
+                            var task = stream.ReadAsync(buf, 0, inLen);
+                            if (Task.WaitAny(new Task[] { task }, 300) == 0 && !task.IsFaulted && task.Result > 0) {
+                                if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
+                                    return true;
+                                }
                             }
+                            Thread.Sleep(40);
                         }
                     }
                 }
@@ -264,27 +269,27 @@ if ($Watch) {
     $offlineStreak = 0
 
     while ($true) {
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 300
         try {
             $idleMs = [LogiController]::GetIdleTimeMs()
 
-            # 1. 如果用户正在 Windows 上操作鼠标或打字，代表用户在当前系统，锁定不切
-            if ($idleMs -lt 350) {
+            # 1. 如果用户近期 (2秒内) 在 Windows 上有按键或鼠标移动，代表正在正常使用 Windows，绝对锁定不切
+            if ($idleMs -lt 2000) {
                 $offlineStreak = 0
                 $onlineStreak++
-                if (-not $isArmed -and $onlineStreak -ge 4) {
+                if (-not $isArmed -and $onlineStreak -ge 3) {
                     $isArmed = $true
                 }
                 continue
             }
 
-            # 2. 用户手已停下，监测键盘是否切往 Mac
+            # 2. 用户手已停下 > 2秒，探测键盘是否已真正离开当前 Windows
             $isKbdOnline = [LogiController]::CheckKeyboardOnline()
 
             if ($isKbdOnline) {
                 $onlineStreak++
                 $offlineStreak = 0
-                if (-not $isArmed -and $onlineStreak -ge 4) {
+                if (-not $isArmed -and $onlineStreak -ge 3) {
                     $isArmed = $true
                 }
             } else {
@@ -292,19 +297,19 @@ if ($Watch) {
                 $onlineStreak = 0
 
                 # 键盘离线门槛:
-                # 刚才在用电脑 ($idleMs < 8000ms): 确认 2 次 (~400ms) 立即切鼠标
-                # 长时间挂机 ($idleMs >= 8000ms): 确认 5 次 (~1000ms) 避免休眠误切
-                $neededStreak = if ($idleMs -lt 8000) { 2 } else { 5 }
+                # 只有此前处于已布防状态 ($isArmed = $true，即键盘曾活跃在 Win)
+                # 并且连续检测 4 次（每次含 2 次重试与 300ms 间隔，共约 2 秒多持续离线），才认定键盘切走
+                $neededStreak = 4
 
                 if ($isArmed -and $offlineStreak -ge $neededStreak) {
-                    # 键盘已切回 Mac！立即同步将鼠标切回通道 1 (Mac)
+                    # 确认键盘已切回 Mac！立即同步将 MX Master 3 鼠标切回通道 1 (Mac)
                     [LogiController]::SwitchDevices(1) | Out-Null
 
-                    # 退出布防，进入冷静期 (等待键盘重新切回 Windows)
+                    # 退出布防，进入 4 秒冷静期 (等待键盘重新切回 Windows)
                     $isArmed = $false
                     $offlineStreak = 0
                     $onlineStreak = 0
-                    Start-Sleep -Milliseconds 3000
+                    Start-Sleep -Milliseconds 4000
                 }
             }
         } catch {
