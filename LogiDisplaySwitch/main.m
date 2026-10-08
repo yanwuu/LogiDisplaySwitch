@@ -2,6 +2,7 @@
 #import "DisplayBridge.h"
 #import "DeviceWatcher.h"
 #import "MouseSwitch.h"
+#import "NetSync.h"
 #import "AppDelegate.h"
 
 #define DEFAULT_TARGET_DEVICE   @"MX Keys"
@@ -178,6 +179,7 @@ int main(int argc, const char * argv[]) {
         }
         
         if (doToWin) {
+            broadcastSwitchSignal("LOGI:SWITCH_TO_WIN");
             printf("1. 正在将 MX Master 3 鼠标切换至通道 2 (Windows)...\n");
             switchMouseToChannel(2);
             
@@ -192,6 +194,7 @@ int main(int argc, const char * argv[]) {
         }
         
         if (doToMac) {
+            broadcastSwitchSignal("LOGI:SWITCH_TO_MAC");
             printf("1. 正在将 MX Master 3 鼠标切换至通道 1 (Mac)...\n");
             switchMouseToChannel(1);
             
@@ -217,14 +220,17 @@ int main(int argc, const char * argv[]) {
             watcher.onStateChanged = ^(BOOL isConnected, NSString *deviceName) {
                 if (isConnected) {
                     NSLog(@"🎉 罗技设备 [%@] 切回 Mac，正在联动切换鼠标和显示器至 Mac...", deviceName);
-                    // 1. 同步将鼠标切回通道 1 (Mac)
+                    // 1. 发送局域网即时通知，让 Windows 上的 LogiSync 立即放行鼠标
+                    broadcastSwitchSignal("LOGI:SWITCH_TO_MAC");
+                    
+                    // 2. 同步尝试在 Mac 本地切鼠标 (若鼠标已在 Mac)
                     NSLog(@"🖱️ 正在命令 MX Master 3 鼠标切换到通道 1 (Mac)...");
                     switchMouseToChannel(1);
                     
-                    // 2. 缓冲 100ms
+                    // 3. 缓冲 100ms
                     usleep(100000);
                     
-                    // 3. 切换显示器至 Type-C
+                    // 4. 切换显示器至 Type-C
                     NSLog(@"🖥️ 正在切换显示器至 Type-C (%d)...", macInput);
                     int ret = setDisplayInput(1, macInput);
                     if (ret == 0) {
@@ -234,7 +240,10 @@ int main(int argc, const char * argv[]) {
                     }
                 } else {
                     NSLog(@"🚀 罗技设备 [%@] 切往 Windows (通道 2)...", deviceName);
-                    // 1. 核心关键：在切屏的同时，立即通过 HID++ 发送指令让 MX Master 3 也切到通道 2！
+                    // 1. 发送局域网切往 Win 信号
+                    broadcastSwitchSignal("LOGI:SWITCH_TO_WIN");
+                    
+                    // 2. 核心关键：在切屏的同时，立即通过 HID++ 发送指令让 MX Master 3 也切到通道 2！
                     NSLog(@"🖱️ 正在自动命令 MX Master 3 鼠标切换到通道 2 (Windows)...");
                     bool mouseOk = switchMouseToChannel(2);
                     if (mouseOk) {
@@ -243,10 +252,10 @@ int main(int argc, const char * argv[]) {
                         NSLog(@"ℹ️ 鼠标未在 Mac 上响应（可能已切走或未连接）");
                     }
                     
-                    // 2. 缓冲 150ms 保证蓝牙切离总线稳定
+                    // 3. 缓冲 150ms 保证蓝牙切离总线稳定
                     usleep(150000);
                     
-                    // 3. 切换显示器至 Windows DP
+                    // 4. 切换显示器至 Windows DP
                     NSLog(@"🖥️ 正在切换显示器至 DP (%d)...", winInput);
                     int ret = setDisplayInput(1, winInput);
                     if (ret == 0) {

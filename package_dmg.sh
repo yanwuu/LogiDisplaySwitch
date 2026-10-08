@@ -11,6 +11,7 @@ clang -c LogiDisplaySwitch/DisplayBridge.m -o LogiDisplaySwitch/DisplayBridge.o 
 clang -c LogiDisplaySwitch/DeviceWatcher.m -o LogiDisplaySwitch/DeviceWatcher.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
 clang -c LogiDisplaySwitch/AppDelegate.m -o LogiDisplaySwitch/AppDelegate.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
 clang -c LogiDisplaySwitch/MouseSwitch.m -o LogiDisplaySwitch/MouseSwitch.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
+clang -c LogiDisplaySwitch/NetSync.m -o LogiDisplaySwitch/NetSync.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
 
 clang -fobjc-arc -fmodules -fmodules-cache-path=.module_cache \
   LogiDisplaySwitch/main.m \
@@ -18,6 +19,7 @@ clang -fobjc-arc -fmodules -fmodules-cache-path=.module_cache \
   LogiDisplaySwitch/DeviceWatcher.o \
   LogiDisplaySwitch/DisplayBridge.o \
   LogiDisplaySwitch/MouseSwitch.o \
+  LogiDisplaySwitch/NetSync.o \
   m1ddc-src/library/libm1ddc.a \
   -framework CoreDisplay -framework CoreGraphics -framework Foundation -framework IOKit -framework AppKit -framework IOBluetooth \
   -o LogiDisplaySwitch/LogiDisplaySwitch

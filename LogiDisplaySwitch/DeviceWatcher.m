@@ -1,4 +1,5 @@
 #import "DeviceWatcher.h"
+#import "NetSync.h"
 #import <AppKit/AppKit.h>
 #import <IOBluetooth/IOBluetooth.h>
 
@@ -161,6 +162,7 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
                 self->_isTargetConnected = YES;
                 self->_lastChangeTime = [[NSDate date] timeIntervalSince1970];
                 NSLog(@"[DeviceWatcher] 确认目标设备已稳定连回 Mac，触发切回 Mac (Type-C)！");
+                broadcastSwitchSignal("LOGI:SWITCH_TO_MAC");
                 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
                     if (self.onStateChanged) {
                         self.onStateChanged(YES, name);
@@ -189,6 +191,7 @@ static void HandleDeviceRemoval(void *context, IOReturn result, void *sender, IO
                 self->_isTargetConnected = NO;
                 self->_lastChangeTime = [[NSDate date] timeIntervalSince1970];
                 NSLog(@"[DeviceWatcher] 确认目标设备已真正切离 Mac，立即触发切往 Windows (DP)！");
+                broadcastSwitchSignal("LOGI:SWITCH_TO_WIN");
                 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
                     if (self.onStateChanged) {
                         self.onStateChanged(NO, name);

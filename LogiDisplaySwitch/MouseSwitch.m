@@ -25,10 +25,15 @@ bool switchMouseToChannel(int channel) {
         return false;
     }
     IOHIDManagerSetDeviceMatching(mgr, NULL);
+    IOReturn mgrRet = IOHIDManagerOpen(mgr, kIOHIDOptionsTypeNone);
+    if (mgrRet != kIOReturnSuccess) {
+        NSLog(@"[MouseSwitch] ⚠️ IOHIDManagerOpen 状态: 0x%08x", mgrRet);
+    }
 
     CFSetRef set = IOHIDManagerCopyDevices(mgr);
     if (!set) {
         NSLog(@"[MouseSwitch] ❌ 未扫描到任何 HID 设备");
+        IOHIDManagerClose(mgr, kIOHIDOptionsTypeNone);
         CFRelease(mgr);
         return false;
     }
@@ -40,7 +45,7 @@ bool switchMouseToChannel(int channel) {
     bool switched = false;
     // MX Master 3 与常见罗技鼠标的 ChangeHost Feature Index 通常为 0x09，少数批次为 0x08 或 0x0A
     const uint8_t feat_candidates[] = { 0x09, 0x08, 0x0A, 0x07 };
-    const uint8_t dev_candidates[]  = { 0xFF, 0x01, 0x02 };
+    const uint8_t dev_candidates[]  = { 0xFF, 0x01, 0x02, 0x04 };
 
     for (CFIndex i = 0; i < count; i++) {
         IOHIDDeviceRef d = devices[i];
@@ -59,10 +64,10 @@ bool switchMouseToChannel(int channel) {
 
         NSLog(@"[MouseSwitch] 🔍 发现目标鼠标: [%s] (VID: 0x%04X)", name, vid);
 
+        // 尝试打开单设备（若已由 Manager 打开则忽略错误，继续下发）
         IOReturn devOpenRet = IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone);
         if (devOpenRet != kIOReturnSuccess) {
-            NSLog(@"[MouseSwitch] ⚠️ 打开鼠标设备 [%s] 失败: 0x%08x", name, devOpenRet);
-            continue;
+            NSLog(@"[MouseSwitch] ℹ️ IOHIDDeviceOpen [%s]: 0x%08x (由 Manager 统一托管，直接下发指令)", name, devOpenRet);
         }
 
         // 直接向鼠标下发 HID++ 2.0 ChangeHost (0x1814) 指令
@@ -85,11 +90,14 @@ bool switchMouseToChannel(int channel) {
             }
         }
 
-        IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
+        if (devOpenRet == kIOReturnSuccess) {
+            IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
+        }
     }
 
     free(devices);
     CFRelease(set);
+    IOHIDManagerClose(mgr, kIOHIDOptionsTypeNone);
     CFRelease(mgr);
     return switched;
 }

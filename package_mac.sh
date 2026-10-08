@@ -7,11 +7,12 @@ cd "$DIR"
 echo "==> 编译 m1ddc 静态库..."
 cd m1ddc-src && make lib CFLAGS="-Wall -Werror -Wextra -fmodules -fmodules-cache-path=.module_cache" > /dev/null && cd ..
 
-echo "==> 编译 Object 文件 (DisplayBridge, DeviceWatcher, AppDelegate, MouseSwitch)..."
+echo "==> 编译 Object 文件 (DisplayBridge, DeviceWatcher, AppDelegate, MouseSwitch, NetSync)..."
 clang -c LogiDisplaySwitch/DisplayBridge.m -o LogiDisplaySwitch/DisplayBridge.o -I m1ddc-src/library -I m1ddc-src/headers -fmodules -fmodules-cache-path=.module_cache
 clang -c LogiDisplaySwitch/DeviceWatcher.m -o LogiDisplaySwitch/DeviceWatcher.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
 clang -c LogiDisplaySwitch/AppDelegate.m -o LogiDisplaySwitch/AppDelegate.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
 clang -c LogiDisplaySwitch/MouseSwitch.m -o LogiDisplaySwitch/MouseSwitch.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
+clang -c LogiDisplaySwitch/NetSync.m -o LogiDisplaySwitch/NetSync.o -fobjc-arc -fmodules -fmodules-cache-path=.module_cache
 
 echo "==> 链接 LogiDisplaySwitch 可执行程序..."
 clang -fobjc-arc -fmodules -fmodules-cache-path=.module_cache \
@@ -20,6 +21,7 @@ clang -fobjc-arc -fmodules -fmodules-cache-path=.module_cache \
   LogiDisplaySwitch/DeviceWatcher.o \
   LogiDisplaySwitch/DisplayBridge.o \
   LogiDisplaySwitch/MouseSwitch.o \
+  LogiDisplaySwitch/NetSync.o \
   m1ddc-src/library/libm1ddc.a \
   -framework CoreDisplay -framework CoreGraphics -framework Foundation -framework IOKit -framework AppKit -framework IOBluetooth \
   -o LogiDisplaySwitch/LogiDisplaySwitch

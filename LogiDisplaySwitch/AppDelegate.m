@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "DisplayBridge.h"
 #import "MouseSwitch.h"
+#import "NetSync.h"
 
 #define DEFAULT_TARGET_DEVICE   @"MX Keys"
 #define DEFAULT_WIN_INPUT       16
@@ -177,14 +178,17 @@
     int winCode = [self.winInputField.stringValue intValue];
     if (winCode <= 0) winCode = DEFAULT_WIN_INPUT;
     
-    // 1. 同步切鼠标通道 2
+    // 1. 发送局域网切往 Win 信号
+    broadcastSwitchSignal("LOGI:SWITCH_TO_WIN");
+
+    // 2. 同步切鼠标通道 2
     switchMouseToChannel(2);
     self.logStatusLabel.stringValue = [NSString stringWithFormat:@"已切鼠标通道2，正在切换显示器至 Windows (DP %d)...", winCode];
     
-    // 2. 缓冲 150ms 给蓝牙总线
+    // 3. 缓冲 150ms 给蓝牙总线
     usleep(150000);
     
-    // 3. 切显示器
+    // 4. 切显示器
     int res = setDisplayInput(1, winCode);
     if (res == 0) {
         self.logStatusLabel.stringValue = @"✅ 成功切到 Windows (DP & 鼠标已切通道2)";
@@ -197,14 +201,17 @@
     int macCode = [self.macInputField.stringValue intValue];
     if (macCode <= 0) macCode = DEFAULT_MAC_INPUT;
     
-    // 1. 同步切鼠标通道 1
+    // 1. 发送局域网切往 Mac 信号
+    broadcastSwitchSignal("LOGI:SWITCH_TO_MAC");
+
+    // 2. 同步切鼠标通道 1
     switchMouseToChannel(1);
     self.logStatusLabel.stringValue = [NSString stringWithFormat:@"已切鼠标通道1，正在切换显示器至 Mac (Type-C %d)...", macCode];
     
-    // 2. 缓冲 100ms
+    // 3. 缓冲 100ms
     usleep(100000);
     
-    // 3. 切显示器
+    // 4. 切显示器
     int res = setDisplayInput(1, macCode);
     if (res == 0) {
         self.logStatusLabel.stringValue = @"✅ 成功切到 Mac (Type-C & 鼠标已切通道1)";

@@ -1,9 +1,9 @@
 <#
-    LogiSync.ps1 - Windows 端罗技鼠标跟随键盘专用极速联动服务
+    LogiSync.ps1 - Windows 端罗技鼠标跟随键盘专用极速联动服务 (双引擎版)
     架构设计:
-      - 显示器切源: 由键盘与 Mac 联动全权负责 (键盘切离 Mac 切 DP，键盘连回 Mac 切 Type-C)
-      - Windows 核心使命: 专职负责让 MX Master 3 鼠标跟随键盘通道 (键盘回 Mac 时鼠标毫秒级切回 Mac)
-      - 彻底移除 Windows 端对显示器的软控，杜绝切屏回弹与误切
+      - 引擎 1 (主引擎): 局域网 UDP 瞬发接收 (监听 52417 端口)，Mac 切回时 0ms 瞬时联动切鼠标
+      - 引擎 2 (辅引擎): 本地智能 HID++ 槽位自识别 (MX Keys 与 MX Master 3) + 键盘在线探针
+      - 核心铁律: 绝对不下发键盘槽位 (杜绝切屏回弹)，解除鼠标晃动对看门狗的死锁
 #>
 param(
     [switch]$Test,
@@ -22,12 +22,14 @@ using Microsoft.Win32.SafeHandles;
 using System.IO;
 using System.Threading.Tasks;
 using System.Threading;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 
 public class LogiController {
     const int  DIGCF_PRESENT = 0x02, DIGCF_DEVICEINTERFACE = 0x10;
     const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000;
     const uint FILE_SHARE_RW = 0x03, OPEN_EXISTING = 3, FILE_FLAG_OVERLAPPED = 0x40000000;
-    const int  HIDP_STATUS_SUCCESS = 0x00110000;
 
     [StructLayout(LayoutKind.Sequential)]
     struct GUID { public uint a; public ushort b, c; [MarshalAs(UnmanagedType.ByValArray, SizeConst=8)] public byte[] d; }
@@ -82,7 +84,6 @@ public class LogiController {
     [DllImport("kernel32.dll")]
     public static extern uint GetTickCount();
 
-    // 获取距离上一次用户在 Windows 上打字或移动鼠标的毫秒数
     public static uint GetIdleTimeMs() {
         LASTINPUTINFO lii = new LASTINPUTINFO();
         lii.cbSize = (uint)Marshal.SizeOf(lii);
@@ -95,7 +96,55 @@ public class LogiController {
 
     public class HidIface {
         public string Path;
+        public string ProdName;
         public ushort UsagePage, Usage, Pid, InLen, OutLen;
+    }
+
+    public static byte CachedKbdSlot = 0x01;
+    public static byte CachedMouseSlot = 0x02;
+    public static string DetectedKbdName = "";
+    public static string DetectedMouseName = "";
+    public static DateTime LastUdpSwitch = DateTime.MinValue;
+
+    private static UdpClient _udpListener = null;
+    private static Thread _udpThread = null;
+    private static bool _udpRunning = false;
+
+    public static void StartUdpListener() {
+        if (_udpRunning) return;
+        _udpRunning = true;
+        _udpThread = new Thread(() => {
+            try {
+                _udpListener = new UdpClient();
+                _udpListener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                _udpListener.Client.Bind(new IPEndPoint(IPAddress.Any, 52417));
+                _udpListener.EnableBroadcast = true;
+                IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+                while (_udpRunning) {
+                    byte[] data = _udpListener.Receive(ref remoteEP);
+                    if (data != null && data.Length > 0) {
+                        string msg = Encoding.ASCII.GetString(data);
+                        if (msg.StartsWith("LOGI:SWITCH_TO_MAC")) {
+                            if ((DateTime.UtcNow - LastUdpSwitch).TotalSeconds > 2.0) {
+                                LastUdpSwitch = DateTime.UtcNow;
+                                Console.WriteLine("[LogiSync] 收到 Mac 局域网 UDP 瞬发切鼠指令！立即将鼠标切回 Mac (通道 1)...");
+                                SwitchDevices(1);
+                            }
+                        }
+                    }
+                }
+            } catch {}
+        });
+        _udpThread.IsBackground = true;
+        _udpThread.Start();
+    }
+
+    public static void StopUdpListener() {
+        _udpRunning = false;
+        if (_udpListener != null) {
+            try { _udpListener.Close(); } catch {}
+            _udpListener = null;
+        }
     }
 
     public static List<HidIface> GetUnifyingInterfaces() {
@@ -123,8 +172,14 @@ public class LogiController {
                     HidD_FreePreparsedData(pp);
 
                     if (caps.UsagePage >= 0xFF00 && caps.OutputLen >= 20) {
+                        char[] prodBuf = new char[128];
+                        string prodName = "";
+                        if (HidD_GetProductString(h, prodBuf, 128)) {
+                            prodName = new string(prodBuf).TrimEnd('\0').Trim();
+                        }
                         list.Add(new HidIface {
                             Path = detail.DevicePath,
+                            ProdName = prodName,
                             UsagePage = caps.UsagePage,
                             Usage = caps.Usage,
                             Pid = attrs.Pid,
@@ -138,13 +193,103 @@ public class LogiController {
         return list;
     }
 
-    // 毫秒级极速切鼠标 (优先瞬发 MX Master 3 槽位 0x04 与 0x02，严格杜绝下发键盘 0x01)
+    public static void DetectDevices() {
+        var ifaces = GetUnifyingInterfaces();
+        byte[] probeSlots = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xFF };
+
+        foreach (var iface in ifaces) {
+            string lowerIface = iface.ProdName.ToLower();
+            if (lowerIface.Contains("key") || lowerIface.Contains("craft")) {
+                DetectedKbdName = iface.ProdName;
+            }
+            if (lowerIface.Contains("master") || lowerIface.Contains("mouse") || lowerIface.Contains("anywhere")) {
+                DetectedMouseName = iface.ProdName;
+            }
+
+            try {
+                using (var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero)) {
+                    if (h.IsInvalid) continue;
+                    using (var stream = new FileStream(h, FileAccess.ReadWrite, 1, true)) {
+                        int outLen = iface.OutLen;
+                        int inLen = iface.InLen;
+                        if (outLen < 20 || inLen < 5) continue;
+
+                        foreach (byte s in probeSlots) {
+                            byte[] frame = new byte[outLen];
+                            frame[0] = 0x11;
+                            frame[1] = s;
+                            frame[2] = 0x00; // Root
+                            frame[3] = 0x00; // getFeature
+                            frame[4] = 0x00;
+                            frame[5] = 0x05; // 0x0005: DEVICE_NAME
+                            try { stream.Write(frame, 0, outLen); } catch { continue; }
+
+                            byte[] buf = new byte[inLen];
+                            var task = stream.ReadAsync(buf, 0, inLen);
+                            if (Task.WaitAny(new Task[] { task }, 100) == 0 && !task.IsFaulted && task.Result > 0) {
+                                if (buf.Length >= 5 && buf[1] == s && buf[2] == 0x00 && buf[4] != 0) {
+                                    byte nameFeat = buf[4];
+                                    byte[] nameReq = new byte[outLen];
+                                    nameReq[0] = 0x11;
+                                    nameReq[1] = s;
+                                    nameReq[2] = nameFeat;
+                                    nameReq[3] = (byte)((1 << 4) | 0x0A); // getDeviceName
+                                    nameReq[4] = 0x00;
+                                    try { stream.Write(nameReq, 0, outLen); } catch { continue; }
+
+                                    byte[] nameBuf = new byte[inLen];
+                                    var nameTask = stream.ReadAsync(nameBuf, 0, inLen);
+                                    if (Task.WaitAny(new Task[] { nameTask }, 100) == 0 && !nameTask.IsFaulted && nameTask.Result > 0) {
+                                        string devName = "";
+                                        for (int b = 5; b < nameBuf.Length && nameBuf[b] != 0; b++) {
+                                            devName += (char)nameBuf[b];
+                                        }
+                                        devName = devName.Trim();
+                                        string lower = devName.ToLower();
+                                        if (lower.Contains("key") || lower.Contains("craft") || lower.Contains("k38") || lower.Contains("k78") || lower.Contains("k85")) {
+                                            CachedKbdSlot = s;
+                                            DetectedKbdName = devName;
+                                        } else if (lower.Contains("master") || lower.Contains("mouse") || lower.Contains("anywhere") || lower.Contains("lift") || lower.Contains("m72")) {
+                                            CachedMouseSlot = s;
+                                            DetectedMouseName = devName;
+                                        }
+                                    }
+                                }
+                            }
+                            Thread.Sleep(15);
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
+
     public static int SwitchDevices(int targetChannel) {
         byte hostVal = (byte)(targetChannel - 1);
         int successCount = 0;
         var ifaces = GetUnifyingInterfaces();
 
+        // 构造候选鼠标槽位列表:
+        // 包含 0xFF (蓝牙/直连), CachedMouseSlot, 0x04, 0x02, 0x03, 0x05, 0x01
+        // 严格排除: CachedKbdSlot (绝对不下发键盘槽位，防止键盘倒切回弹)
+        List<byte> slotsToSend = new List<byte>();
+        slotsToSend.Add(0xFF);
+        if (CachedMouseSlot != 0 && CachedMouseSlot != CachedKbdSlot && !slotsToSend.Contains(CachedMouseSlot)) {
+            slotsToSend.Add(CachedMouseSlot);
+        }
+        byte[] defaults = new byte[] { 0x04, 0x02, 0x03, 0x05, 0x01 };
+        foreach (byte s in defaults) {
+            if (s != CachedKbdSlot && !slotsToSend.Contains(s)) {
+                slotsToSend.Add(s);
+            }
+        }
+
+        byte[] feats = new byte[] { 0x09, 0x08, 0x0A, 0x07 };
+
         foreach (var iface in ifaces) {
+            string lowerIface = iface.ProdName.ToLower();
+            if (lowerIface.Contains("key") || lowerIface.Contains("craft")) continue;
+
             try {
                 using (var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero)) {
                     if (h.IsInvalid) continue;
@@ -152,26 +297,7 @@ public class LogiController {
                         int outLen = iface.OutLen;
                         if (outLen < 20) continue;
 
-                        // 1. 第一拍极速直发目标鼠标 MX Master 3 (通常为槽位 0x04 或 0x02)，0 延迟下发！
-                        // 注意: 绝不包含 0x01 (键盘)！键盘是唯一物理主控，严禁软件倒切键盘导致切屏回弹！
-                        byte[] prioritySlots = new byte[] { 0x04, 0x02 };
-                        foreach (byte slot in prioritySlots) {
-                            byte[] frame = new byte[outLen];
-                            frame[0] = 0x11;
-                            frame[1] = slot;
-                            frame[2] = 0x09; // Feature 0x09 (ChangeHost)
-                            frame[3] = (byte)((1 << 4) | 0x0A);
-                            frame[4] = hostVal;
-                            try {
-                                stream.Write(frame, 0, outLen);
-                                successCount++;
-                            } catch {}
-                        }
-
-                        // 2. 第二拍冗余补发鼠标候选槽位 (绝不包含 0x01 键盘槽位)
-                        byte[] mouseSlots = new byte[] { 0x04, 0x02, 0x03, 0x05 };
-                        byte[] feats = new byte[] { 0x09, 0x08, 0x0A, 0x07 };
-                        foreach (byte slot in mouseSlots) {
+                        foreach (byte slot in slotsToSend) {
                             foreach (byte feat in feats) {
                                 byte[] frame = new byte[outLen];
                                 frame[0] = 0x11;
@@ -182,7 +308,7 @@ public class LogiController {
                                 try {
                                     stream.Write(frame, 0, outLen);
                                     successCount++;
-                                    Thread.Sleep(10);
+                                    Thread.Sleep(5);
                                 } catch {}
                             }
                         }
@@ -193,10 +319,14 @@ public class LogiController {
         return successCount;
     }
 
-    // 监测键盘 (槽位 0x01) 是否在当前 Windows 接收器上在线
     public static bool CheckKeyboardOnline() {
         var ifaces = GetUnifyingInterfaces();
+        byte targetKbd = CachedKbdSlot != 0 ? CachedKbdSlot : (byte)0x01;
+
         foreach (var iface in ifaces) {
+            string lowerIface = iface.ProdName.ToLower();
+            if (lowerIface.Contains("master") || lowerIface.Contains("mouse") || lowerIface.Contains("anywhere")) continue;
+
             try {
                 using (var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero)) {
                     if (h.IsInvalid) continue;
@@ -207,13 +337,12 @@ public class LogiController {
 
                         byte[] frame = new byte[outLen];
                         frame[0] = 0x11;
-                        frame[1] = 0x01; // MX Keys 槽位 1
+                        frame[1] = targetKbd;
                         frame[2] = 0x00; // Root Feature
                         frame[3] = (byte)((0 << 4) | 0x0A);
                         frame[4] = 0x18;
                         frame[5] = 0x14; // Feature 0x1814 (ChangeHost)
 
-                        // 尝试最多 2 次查询 (每次 300ms 超时)，消除无线丢包或键盘浅度省电唤醒延迟
                         for (int attempt = 0; attempt < 2; attempt++) {
                             try {
                                 stream.Write(frame, 0, outLen);
@@ -221,12 +350,12 @@ public class LogiController {
 
                             byte[] buf = new byte[inLen];
                             var task = stream.ReadAsync(buf, 0, inLen);
-                            if (Task.WaitAny(new Task[] { task }, 300) == 0 && !task.IsFaulted && task.Result > 0) {
-                                if (buf.Length >= 5 && buf[1] == 0x01 && buf[2] == 0x00 && buf[4] != 0) {
+                            if (Task.WaitAny(new Task[] { task }, 250) == 0 && !task.IsFaulted && task.Result > 0) {
+                                if (buf.Length >= 5 && buf[1] == targetKbd && buf[2] == 0x00 && buf[4] != 0) {
                                     return true;
                                 }
                             }
-                            Thread.Sleep(40);
+                            Thread.Sleep(30);
                         }
                     }
                 }
@@ -240,17 +369,29 @@ public class LogiController {
 # 测试入口
 if ($Test) {
     Write-Host '==============================================================' -ForegroundColor Cyan
-    Write-Host '  LogiSync 鼠标切通道测试模式' -ForegroundColor Cyan
+    Write-Host '  LogiSync 罗技键鼠槽位与联动测试模式' -ForegroundColor Cyan
     Write-Host '==============================================================' -ForegroundColor Cyan
     Write-Host ''
+    Write-Host '正在探测当前连接的罗技硬件与槽位...' -ForegroundColor Yellow
+    [LogiController]::DetectDevices()
+    
+    $kbdName = if ([LogiController]::DetectedKbdName) { [LogiController]::DetectedKbdName } else { "默认槽位" }
+    $mouseName = if ([LogiController]::DetectedMouseName) { [LogiController]::DetectedMouseName } else { "默认槽位" }
+    
+    Write-Host "  [+] 键盘槽位: Slot 0x$([LogiController]::CachedKbdSlot.ToString('X2')) ($kbdName)" -ForegroundColor Green
+    Write-Host "  [+] 鼠标槽位: Slot 0x$([LogiController]::CachedMouseSlot.ToString('X2')) ($mouseName)" -ForegroundColor Green
+    Write-Host ''
+    
     $idle = [LogiController]::GetIdleTimeMs()
     Write-Host "当前 Windows 键鼠空闲时间: $idle ms" -ForegroundColor White
     $isOnline = [LogiController]::CheckKeyboardOnline()
-    Write-Host "MX Keys 键盘在 Win 在线状态: $isOnline" -ForegroundColor White
+    Write-Host "键盘在 Windows 在线状态: $isOnline" -ForegroundColor White
     Write-Host ''
-    Write-Host '正在将 MX Master 3 鼠标切回通道 1 (Mac)...' -ForegroundColor Yellow
+    
+    Write-Host '正在测试将鼠标切换至通道 1 (Mac)...' -ForegroundColor Yellow
     $cnt = [LogiController]::SwitchDevices(1)
-    Write-Host "   [+] 切换数据包发送完毕 (共发送 $cnt 次)！请观察 MX Master 3 指示灯是否跳至 1." -ForegroundColor Green
+    Write-Host "  [+] 指令已下发完毕 (成功发送 $cnt 次数据包)！" -ForegroundColor Green
+    Write-Host '  [+] 请观察 MX Master 3 鼠标指示灯是否跳至 1.' -ForegroundColor Green
     Write-Host ''
     Write-Host '测试完成。' -ForegroundColor Cyan
     exit 0
@@ -258,32 +399,35 @@ if ($Test) {
 
 # 快捷单次切鼠标回 Mac
 if ($SwitchToMac) {
+    [LogiController]::DetectDevices()
     [LogiController]::SwitchDevices(1) | Out-Null
     exit 0
 }
 
-# 后台静默守护进程: 纯鼠标通道跟随守护
+# 后台静默守护进程: 双引擎键鼠联动守护
 if ($Watch) {
+    # 1. 启动局域网 UDP 极速监听引擎 (Mac 切回时 0ms 瞬发响应)
+    [LogiController]::StartUdpListener()
+
+    # 2. 初始化硬件槽位自识别
+    [LogiController]::DetectDevices()
+
     $isArmed = $false
     $onlineStreak = 0
     $offlineStreak = 0
+    $detectCounter = 0
 
     while ($true) {
         Start-Sleep -Milliseconds 300
         try {
-            $idleMs = [LogiController]::GetIdleTimeMs()
-
-            # 1. 如果用户近期 (2秒内) 在 Windows 上有按键或鼠标移动，代表正在正常使用 Windows，绝对锁定不切
-            if ($idleMs -lt 2000) {
-                $offlineStreak = 0
-                $onlineStreak++
-                if (-not $isArmed -and $onlineStreak -ge 3) {
-                    $isArmed = $true
-                }
-                continue
+            $detectCounter++
+            # 每隔约 60 秒刷新一次槽位探测，适应热插拔
+            if ($detectCounter -gt 200) {
+                $detectCounter = 0
+                [LogiController]::DetectDevices()
             }
 
-            # 2. 用户手已停下 > 2秒，探测键盘是否已真正离开当前 Windows
+            # 探测键盘在线状态
             $isKbdOnline = [LogiController]::CheckKeyboardOnline()
 
             if ($isKbdOnline) {
@@ -296,16 +440,20 @@ if ($Watch) {
                 $offlineStreak++
                 $onlineStreak = 0
 
-                # 键盘离线门槛:
-                # 只有此前处于已布防状态 ($isArmed = $true，即键盘曾活跃在 Win)
-                # 并且连续检测 4 次（每次含 2 次重试与 300ms 间隔，共约 2 秒多持续离线），才认定键盘切走
-                $neededStreak = 4
+                # 键盘离线判定:
+                # 1. 键盘此前已在 Win 布防 ($isArmed = $true)
+                # 2. 连续 2 次确认离线 (~500ms)
+                # 3. 并且用户近期 (30秒内) 在当前电脑有活动 (避免用户挂机离开导致键盘休眠误切)
+                $idleMs = [LogiController]::GetIdleTimeMs()
+                if ($isArmed -and $offlineStreak -ge 2 -and $idleMs -lt 30000) {
+                    # 检查是否最近 2 秒内刚被 UDP 切换过 (避免重复触发)
+                    $lastUdpSec = ([DateTime]::UtcNow - [LogiController]::LastUdpSwitch).TotalSeconds
+                    if ($lastUdpSec -gt 2.0) {
+                        Write-Host "[LogiSync] 检测到键盘已切往 Mac，本地联动切换鼠标至通道 1..."
+                        [LogiController]::SwitchDevices(1) | Out-Null
+                    }
 
-                if ($isArmed -and $offlineStreak -ge $neededStreak) {
-                    # 确认键盘已切回 Mac！立即同步将 MX Master 3 鼠标切回通道 1 (Mac)
-                    [LogiController]::SwitchDevices(1) | Out-Null
-
-                    # 退出布防，进入 4 秒冷静期 (等待键盘重新切回 Windows)
+                    # 退出布防，进入 4 秒冷静期
                     $isArmed = $false
                     $offlineStreak = 0
                     $onlineStreak = 0
