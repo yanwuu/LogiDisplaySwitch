@@ -2,6 +2,7 @@
 #import "DisplayBridge.h"
 #import "MouseSwitch.h"
 #import "NetSync.h"
+#import <IOKit/hidsystem/IOHIDLib.h>
 
 #define DEFAULT_TARGET_DEVICE   @"MX Keys"
 #define DEFAULT_WIN_INPUT       16
@@ -23,6 +24,9 @@
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    if (!IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)) {
+        IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
+    }
     [self setupStatusItem];
     [self setupMainWindow];
     [self setupWatcher];

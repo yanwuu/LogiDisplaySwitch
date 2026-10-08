@@ -4,6 +4,7 @@
 #import "MouseSwitch.h"
 #import "NetSync.h"
 #import "AppDelegate.h"
+#import <IOKit/hidsystem/IOHIDLib.h>
 
 #define DEFAULT_TARGET_DEVICE   @"MX Keys"
 #define DEFAULT_WIN_INPUT       16      // DisplayPort (ViewSonic VX2880-4K-HDU: 16)
@@ -44,6 +45,9 @@ static void printStatus(NSString *targetPattern) {
            [targetPattern UTF8String],
            connected ? "已连接 (当前在 Mac)" : "未连接 / 已切到其他电脑");
     [watcher stopWatching];
+    
+    BOOL inputPerm = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent);
+    printf("输入监控权限: %s\n", inputPerm ? "✅ 已授权" : "⚠️ 未授权 (请在 系统设置 -> 隐私与安全性 -> 输入监控 中开启)");
     printf("==============================================\n");
 }
 

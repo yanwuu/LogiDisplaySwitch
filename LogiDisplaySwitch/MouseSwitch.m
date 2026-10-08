@@ -1,6 +1,7 @@
 #import "MouseSwitch.h"
 #import <Foundation/Foundation.h>
 #import <IOKit/hid/IOHIDManager.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 
 #define LOGITECH_VID      0x046D
 #define SW_ID             0x0A
@@ -16,6 +17,11 @@ static int32_t prop_int(IOHIDDeviceRef dev, CFStringRef key) {
 
 bool switchMouseToChannel(int channel) {
     if (channel < 1 || channel > 3) return false;
+
+    if (!IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)) {
+        NSLog(@"[MouseSwitch] ⚠️ 当前未授予【输入监控】(Input Monitoring) 权限！正在请求权限... 请在【系统设置 -> 隐私与安全性 -> 输入监控】勾选允许 LogiDisplaySwitch。");
+        IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
+    }
 
     uint8_t host = (uint8_t)(channel - 1);
 
