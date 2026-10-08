@@ -77,6 +77,10 @@ static void installLaunchAgent(const char *binaryPath, NSString *target, int win
         @"    <true/>\n"
         @"    <key>KeepAlive</key>\n"
         @"    <true/>\n"
+        @"    <key>LimitLoadToSessionType</key>\n"
+        @"    <string>Aqua</string>\n"
+        @"    <key>ProcessType</key>\n"
+        @"    <string>Interactive</string>\n"
         @"    <key>StandardOutPath</key>\n"
         @"    <string>%@</string>\n"
         @"    <key>StandardErrorPath</key>\n"
@@ -163,7 +167,12 @@ int main(int argc, const char * argv[]) {
 
         if (doInstall) {
             char resolvedPath[PATH_MAX];
-            realpath(argv[0], resolvedPath);
+            const char *appPath = "/Applications/LogiDisplaySwitch.app/Contents/MacOS/LogiDisplaySwitch";
+            if (access(appPath, X_OK) == 0) {
+                strncpy(resolvedPath, appPath, sizeof(resolvedPath));
+            } else {
+                realpath(argv[0], resolvedPath);
+            }
             installLaunchAgent(resolvedPath, targetDevice, winInput, macInput);
             return 0;
         }

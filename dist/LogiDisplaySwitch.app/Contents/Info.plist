@@ -16,8 +16,10 @@
     <string>2.0</string>
     <key>CFBundleVersion</key>
     <string>2.0</string>
-    <key>NSHighResolutionCapable</key>
+    <key>LSUIElement</key>
     <true/>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>LogiDisplaySwitch 需要控制和切换罗技鼠标硬件通道以实现键鼠自动联动</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>LogiDisplaySwitch 需要访问蓝牙以监测罗技键盘连接状态并联动显示器切换</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
